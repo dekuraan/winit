@@ -596,15 +596,31 @@ impl Shared {
         if self.is_closed() {
             self.exit();
         }
-        match *self.0.runner.borrow_mut() {
-            RunnerEnum::Running(ref mut runner) => {
-                runner.handle_single_event(self, event);
+        // wam local patch: avoid panic on re-entrant `handle_event`. Upstream
+        // unconditionally `borrow_mut()`s `self.0.runner`; if anything in the
+        // user-supplied event handler causes another event to be dispatched
+        // synchronously (Bevy 0.18 + heavy SSE-driven chunk dispatch on the web
+        // single-thread runtime can do this) the second borrow panics. We
+        // promote the second event onto the existing pending queue, mirroring
+        // the `RunnerEnum::Pending` branch — the outer dispatch will drain it
+        // in the queue loop further down.
+        match self.0.runner.try_borrow_mut() {
+            Ok(mut runner) => match *runner {
+                RunnerEnum::Running(ref mut runner) => {
+                    runner.handle_single_event(self, event);
+                },
+                // If an event is being handled without a runner somehow, add it to the event queue
+                // so it will eventually be processed
+                RunnerEnum::Pending => self.0.events.borrow_mut().push_back(event.into()),
+                // If the Runner has been destroyed, there is nothing to do.
+                RunnerEnum::Destroyed => return,
             },
-            // If an event is being handled without a runner somehow, add it to the event queue so
-            // it will eventually be processed
-            RunnerEnum::Pending => self.0.events.borrow_mut().push_back(event.into()),
-            // If the Runner has been destroyed, there is nothing to do.
-            RunnerEnum::Destroyed => return,
+            Err(_) => {
+                // Re-entrant call (parent dispatch still holds the borrow).
+                // Defer instead of panicking; the outer call's queue-drain
+                // loop picks this up.
+                self.0.events.borrow_mut().push_back(event.into());
+            },
         }
 
         let is_closed = self.exiting();
